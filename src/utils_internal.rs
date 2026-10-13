@@ -297,11 +297,14 @@ where
         // Subscribe before the initial drain so packets queued in between aren't missed.
         let mut notification_stream = ble_handler.notifications().await?;
         let mut adapter_events = ble_handler.adapter_events().await?;
+        log::info!("BLEDBG: subscribed to FROMNUM notifications and adapter events");
         let mut buf = [0u8; 1024];
         if let Ok(len) = server.read(&mut buf).await {
+            log::info!("BLEDBG: initial write to radio, {len} bytes");
             ble_handler.write_to_radio(&buf[..len]).await?
         }
-        drain_ble_radio(&ble_handler, &mut server).await?;
+        let count = drain_ble_radio(&ble_handler, &mut server).await?;
+        log::info!("BLEDBG: initial drain read {count} packets");
 
         // FROMNUM notifications are lossy, so poll periodically as a fallback.
         let mut poll = tokio::time::interval(BLE_POLL_INTERVAL);
@@ -315,25 +318,31 @@ where
                 // Data from device, forward it to the user. The FROMNUM value is only a signal
                 // that data is available, so read FROMRADIO until it is empty.
                 notification = notification_stream.next() => {
-                    let fromnum = notification.ok_or(InternalStreamError::Eof)?;
+                    let Some(fromnum) = notification else {
+                        log::info!("BLEDBG: notification stream ended");
+                        Err(InternalStreamError::Eof)?
+                    };
+                    log::info!("BLEDBG: FROMNUM notification, value {fromnum}");
                     let count = drain_ble_radio(&ble_handler, &mut server).await?;
-                    log::debug!("FROMNUM {fromnum}: read {count} packets");
+                    log::info!("BLEDBG: FROMNUM {fromnum} drain read {count} packets");
                 },
                 _ = poll.tick() => {
                     let count = drain_ble_radio(&ble_handler, &mut server).await?;
                     if count > 0 {
-                        log::warn!("BLE poll found {count} packets without a FROMNUM notification");
+                        log::warn!("BLEDBG: poll found {count} packets without a FROMNUM notification");
                     }
                 },
                 // Data from user, forward it to the device
                 from_server = server.read(&mut buf) => {
                     let len = from_server.map_err(duplex_write_error_fn)?;
+                    log::info!("BLEDBG: write to radio, {len} bytes");
                     if len != 0 {
                         ble_handler.write_to_radio(&buf[..len]).await?;
                     }
                 },
                 event = adapter_events.next() => {
                     if Some(AdapterEvent::Disconnected) == event {
+                        log::info!("BLEDBG: adapter reported disconnect");
                         log::error!("BLE disconnected");
                         Err(InternalStreamError::ConnectionLost)?
                     }
@@ -365,6 +374,10 @@ async fn drain_ble_radio(
         match ble_handler.read_from_radio().await? {
             RadioMessage::Eof => return Ok(count),
             RadioMessage::Packet(packet) => {
+                log::info!(
+                    "BLEDBG: read packet from FROMRADIO, {} bytes",
+                    packet.data().len()
+                );
                 server.write_all(packet.data()).await.map_err(|e| {
                     Error::InternalStreamError(InternalStreamError::StreamWriteError {
                         source: Box::new(e),

@@ -376,8 +376,17 @@ impl BleHandler {
                     uuid: FROMNUM,
                     value,
                     ..
-                } => future::ready(Self::parse_u32(value).ok()),
-                _ => future::ready(None),
+                } => {
+                    let parsed = Self::parse_u32(value.clone());
+                    if parsed.is_err() {
+                        log::info!("BLEDBG: unparseable FROMNUM notification {value:?}");
+                    }
+                    future::ready(parsed.ok())
+                }
+                ValueNotification { uuid, .. } => {
+                    log::info!("BLEDBG: ignored notification from {uuid}");
+                    future::ready(None)
+                }
             },
         )))
     }
