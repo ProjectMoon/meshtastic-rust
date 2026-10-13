@@ -282,10 +282,7 @@ pub async fn build_ble_stream<'a, B>(
 where
     B: Into<std::borrow::Cow<'a, crate::connections::ble_handler::BleId>>,
 {
-    use crate::{
-        connections::ble_handler::{AdapterEvent, RadioMessage},
-        errors_internal::InternalStreamError,
-    };
+    use crate::{connections::ble_handler::AdapterEvent, errors_internal::InternalStreamError};
     let ble_id: std::borrow::Cow<_> = device.into();
     let ble_handler = BleHandler::new(&ble_id, scan_duration).await?;
     // `client` will be returned to the user, server is the opposite end of the channel and it's
@@ -297,40 +294,36 @@ where
                 source: Box::new(e),
             })
         };
-        let mut read_messages_count = ble_handler.read_fromnum().await?;
+        // Subscribe before the initial drain so packets queued in between aren't missed.
+        let mut notification_stream = ble_handler.notifications().await?;
+        let mut adapter_events = ble_handler.adapter_events().await?;
         let mut buf = [0u8; 1024];
         if let Ok(len) = server.read(&mut buf).await {
             ble_handler.write_to_radio(&buf[..len]).await?
         }
-        loop {
-            match ble_handler.read_from_radio().await? {
-                RadioMessage::Eof => break,
-                RadioMessage::Packet(packet) => {
-                    server
-                        .write(packet.data())
-                        .await
-                        .map_err(duplex_write_error_fn)?;
-                }
-            }
-        }
+        drain_ble_radio(&ble_handler, &mut server).await?;
 
-        let mut notification_stream = ble_handler.notifications().await?;
-        let mut adapter_events = ble_handler.adapter_events().await?;
+        // FROMNUM notifications are lossy, so poll periodically as a fallback.
+        let mut poll = tokio::time::interval(BLE_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             // Note: the following `tokio::select` is only half-duplex on the BLE radio. While we
             // are reading from the radio, we are not writing to it and vice versa. However, BLE is
             // a half-duplex technology, so we wouldn't gain much with a full duplex solution
             // anyway.
             tokio::select!(
-                // Data from device, forward it to the user
+                // Data from device, forward it to the user. The FROMNUM value is only a signal
+                // that data is available, so read FROMRADIO until it is empty.
                 notification = notification_stream.next() => {
-                    let avail_msg_count = notification.ok_or(InternalStreamError::Eof)?;
-                    for _ in read_messages_count..avail_msg_count {
-                        if let RadioMessage::Packet(packet) = ble_handler.read_from_radio().await? {
-                            server.write(packet.data()).await.map_err(duplex_write_error_fn)?;
-                        }
+                    let fromnum = notification.ok_or(InternalStreamError::Eof)?;
+                    let count = drain_ble_radio(&ble_handler, &mut server).await?;
+                    log::debug!("FROMNUM {fromnum}: read {count} packets");
+                },
+                _ = poll.tick() => {
+                    let count = drain_ble_radio(&ble_handler, &mut server).await?;
+                    if count > 0 {
+                        log::warn!("BLE poll found {count} packets without a FROMNUM notification");
                     }
-                    read_messages_count = avail_msg_count;
                 },
                 // Data from user, forward it to the device
                 from_server = server.read(&mut buf) => {
@@ -353,6 +346,34 @@ where
         stream: client,
         join_handle: Some(tokio_util::task::AbortOnDropHandle::new(handle)),
     })
+}
+
+/// How often the BLE stream polls FROMRADIO when no FROMNUM notification has arrived.
+#[cfg(feature = "bluetooth-le")]
+const BLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Reads FROMRADIO until the radio reports it is empty, forwarding every packet to `server`.
+/// Returns the number of packets read.
+#[cfg(feature = "bluetooth-le")]
+async fn drain_ble_radio(
+    ble_handler: &BleHandler,
+    server: &mut DuplexStream,
+) -> Result<usize, Error> {
+    use crate::{connections::ble_handler::RadioMessage, errors_internal::InternalStreamError};
+    let mut count = 0;
+    loop {
+        match ble_handler.read_from_radio().await? {
+            RadioMessage::Eof => return Ok(count),
+            RadioMessage::Packet(packet) => {
+                server.write_all(packet.data()).await.map_err(|e| {
+                    Error::InternalStreamError(InternalStreamError::StreamWriteError {
+                        source: Box::new(e),
+                    })
+                })?;
+                count += 1;
+            }
+        }
+    }
 }
 
 /// A helper method to generate random numbers using the `rand` crate.
