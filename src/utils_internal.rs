@@ -359,7 +359,7 @@ where
 
 /// How often the BLE stream polls FROMRADIO when no FROMNUM notification has arrived.
 #[cfg(feature = "bluetooth-le")]
-const BLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const BLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Reads FROMRADIO until the radio reports it is empty, forwarding every packet to `server`.
 /// Returns the number of packets read.
